@@ -12,6 +12,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from config import load_settings
+
 log = logging.getLogger(__name__)
 
 
@@ -28,7 +30,7 @@ class VideoMetadata:
 class YouTubeService:
     def __init__(self, cookiefile: str | None = None) -> None:
         self._ytdlp = None
-        self._cookiefile = cookiefile
+        self._cookiefile = cookiefile or load_settings().youtube_cookiefile
 
     def _ydl_opts(self) -> dict:
         opts: dict = {

@@ -47,7 +47,7 @@ class Maintenance:
         problems: list[str] = []
 
         if not ffmpeg.available():
-            problems.append("ffmpeg not on PATH")
+            problems.append("ffmpeg unavailable (check FFMPEG_PATH or PATH)")
         if not YouTubeService().health_check():
             problems.append("yt-dlp import failed")
         if not ollama.available():

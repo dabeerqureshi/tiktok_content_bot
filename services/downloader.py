@@ -33,6 +33,8 @@ def download_video(youtube_id: str, url: str, out_dir: Path | None = None) -> Pa
     # yt-dlp only finds ffmpeg on PATH; point it at the configured binary's dir.
     if settings.ffmpeg_path:
         opts["ffmpeg_location"] = str(Path(settings.ffmpeg_path).resolve().parent)
+    if settings.youtube_cookiefile:
+        opts["cookiefile"] = settings.youtube_cookiefile
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 

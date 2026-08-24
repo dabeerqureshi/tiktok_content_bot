@@ -63,6 +63,23 @@ class PublishWorker(Worker):
     def _publish_due(self) -> None:
         settings = load_settings()
 
+        # Posts stuck in PROCESSING for >24h mean TikTok never resolved the
+        # status; requeue them (bounded by max_attempts) instead of blocking
+        # the pending-upload cap forever.
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE posts SET status='RETRY', next_retry_at=datetime('now'), "
+                "attempts=attempts+1 WHERE status='PROCESSING' "
+                "AND attempts < ? "
+                "AND created_at < datetime('now', '-1 day')",
+                (settings.tiktok_max_attempts,),
+            )
+            conn.execute(
+                "UPDATE posts SET status='FAILED', last_error='stuck in PROCESSING >24h' "
+                "WHERE status='PROCESSING' AND attempts >= ?",
+                (settings.tiktok_max_attempts,),
+            )
+
         # Respect TikTok's ~5 pending API uploads per 24h window.
         in_flight = db.query(
             "SELECT COUNT(*) c FROM posts WHERE status IN ('UPLOADING','PROCESSING')"
@@ -101,6 +118,20 @@ class PublishWorker(Worker):
                 "UPDATE posts SET status='UPLOADING', attempts=attempts+1 WHERE id=?",
                 (post_id,),
             )
+
+        # Fail fast when the clip file is gone (e.g. pruned by retention
+        # cleanup) instead of burning retries on a guaranteed FileNotFoundError.
+        clip_file = Path(clip["file_path"]) if clip["file_path"] else None
+        if not (clip_file and clip_file.exists()):
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE posts SET status='FAILED', last_error='clip file missing: '"
+                    "|| COALESCE(?, 'null') WHERE id=?",
+                    (clip["file_path"], post_id),
+                )
+                conn.execute("UPDATE clips SET status='FAILED' WHERE id=?", (clip["id"],))
+            log.error("Clip file missing for post %s (%s); marked FAILED", post_id, clip["file_path"])
+            return
 
         publish_id = post["tiktok_publish_id"]
         caption = (clip["caption"] or "") + " " + (clip["hashtags"] or "")
@@ -188,7 +219,12 @@ def _next_slot(conn, posts_per_day: int) -> str:
     exist yet.
     """
     interval_s = 86_400.0 / max(1, posts_per_day)
-    row = conn.execute("SELECT MAX(scheduled_at) AS m FROM posts").fetchone()
+    # Only active posts extend the schedule; FAILED/RETRY rows must not
+    # push future slots further away.
+    row = conn.execute(
+        "SELECT MAX(scheduled_at) AS m FROM posts "
+        "WHERE status IN ('PENDING','UPLOADING','PROCESSING')"
+    ).fetchone()
     latest = row["m"] if row and row["m"] else None
     if latest:
         base = datetime.fromisoformat(latest)

@@ -30,7 +30,11 @@ def ffprobe_binary() -> str:
 
 
 def available() -> bool:
-    return bool(shutil.which(ffmpeg_binary()) or shutil.which("ffmpeg"))
+    """True when the configured (or PATH) ffmpeg binary exists and is executable."""
+    binary = ffmpeg_binary()
+    if Path(binary).is_absolute():
+        return Path(binary).is_file()
+    return shutil.which(binary) is not None
 
 
 def make_clip(src: Path, out: Path, start: float, end: float) -> Path:

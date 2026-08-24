@@ -16,14 +16,33 @@ Production notes:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
 import requests
+from dotenv import set_key
 
-from config import load_settings
+from config import BASE_DIR, load_settings
 
 log = logging.getLogger(__name__)
+
+ENV_FILE = BASE_DIR / ".env"
+_persist_lock = threading.Lock()
+
+
+def _persist_tokens(access: str, refresh: str, open_id: str | None) -> None:
+    """Write renewed tokens back to .env (never logged). Thread-safe."""
+    with _persist_lock:
+        try:
+            set_key(str(ENV_FILE), "TIKTOK_ACCESS_TOKEN", access)
+            if refresh:
+                set_key(str(ENV_FILE), "TIKTOK_REFRESH_TOKEN", refresh)
+            if open_id:
+                set_key(str(ENV_FILE), "TIKTOK_OPEN_ID", open_id)
+        except OSError as exc:
+            log.error("Could not persist TikTok tokens to .env: %s "
+                      "(in-memory token still valid for this run)", exc)
 
 INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
@@ -56,12 +75,31 @@ class TikTokService:
     def health_check(self) -> bool:
         return bool(self.access_token and self.open_id)
 
+    def _is_auth_error(self, resp: requests.Response) -> bool:
+        """True when the access token is expired/invalid and refreshable."""
+        if resp.status_code == 401:
+            return True
+        try:
+            code = (resp.json().get("error", {}) or {}).get("code", "")
+        except ValueError:
+            return False
+        return code in ("access_token_invalid", "invalid_access_token", "token_expired")
+
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """POST/PUT with retry + exponential backoff on transient errors."""
         last_exc: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = requests.request(method, url, timeout=60, **kwargs)
+                if (
+                    attempt < MAX_RETRIES
+                    and resp.status_code == 401
+                    and self.refresh_access_token()
+                ):
+                    # Token renewed (and persisted); retry with fresh headers.
+                    if kwargs.get("headers"):
+                        kwargs["headers"]["Authorization"] = f"Bearer {self.access_token}"
+                    continue
                 if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                     wait = RETRY_BACKOFF_SECONDS * attempt
                     log.warning("TikTok %s -> %s, retrying in %ss",
@@ -83,9 +121,14 @@ class TikTokService:
         return _check(resp)
 
     def refresh_access_token(self) -> dict | None:
-        """Exchange the refresh token for a new access token."""
+        """Exchange the refresh token for a new access token.
+
+        New tokens are persisted to .env so restarts keep working; they are
+        never written to logs.
+        """
         s = load_settings()
         if not (s.tiktok_client_key and s.tiktok_refresh_token):
+            log.warning("TikTok refresh token missing - cannot renew access token")
             return None
         resp = self._request(
             "POST", TOKEN_URL,
@@ -97,13 +140,25 @@ class TikTokService:
             },
             headers={"Content-Type": "application/json; charset=UTF-8"},
         )
-        data = _check(resp).get("data", {})
-        if data.get("access_token"):
-            self.access_token = data["access_token"]
-            log.warning("TikTok access token refreshed - update TIKTOK_ACCESS_TOKEN "
-                        "in .env (new token logged at WARNING level only)")
-            return data
-        return None
+        try:
+            data = _check(resp)
+        except TikTokError as exc:
+            log.error("TikTok token refresh failed: %s "
+                      "(re-run scripts/tiktok_auth.py to re-authorize)", exc)
+            return None
+        data = data.get("data") or data  # API returns flat or nested
+        if not (data.get("access_token") and data.get("refresh_token")):
+            log.error("TikTok token refresh returned no tokens - "
+                      "re-run scripts/tiktok_auth.py to re-authorize")
+            return None
+        self.access_token = data["access_token"]
+        _persist_tokens(
+            access=data["access_token"],
+            refresh=data.get("refresh_token"),
+            open_id=data.get("open_id"),
+        )
+        log.info("TikTok access token renewed and persisted to .env")
+        return data
 
     def init_video_upload(self, title: str) -> dict:
         body = {

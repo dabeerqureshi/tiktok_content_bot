@@ -23,8 +23,9 @@ log = logging.getLogger(__name__)
 def _client():
     import ollama  # noqa: PLC0415
 
-    from config import settings  # noqa: PLC0415
-    return ollama.Client(host=settings.ollama_host)
+    # Bounded timeout so a hung Ollama server can't freeze the scheduler
+    # thread forever (large models can take minutes; 15 min is generous).
+    return ollama.Client(host=load_settings().ollama_host, timeout=900.0)
 
 
 def available() -> bool:

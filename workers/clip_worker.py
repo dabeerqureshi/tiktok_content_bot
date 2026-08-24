@@ -55,6 +55,13 @@ class ClipWorker(Worker):
         settings = load_settings()
         video_id, youtube_id = row["id"], row["youtube_id"]
 
+        # Fail fast when the source original was pruned by cleanup.
+        src_file = Path(row["file_path"]) if row["file_path"] else None
+        if not (src_file and src_file.exists()):
+            raise FileNotFoundError(
+                f"source video missing for {youtube_id}: {row['file_path']}"
+            )
+
         # 1. Transcribe
         with db.transaction() as conn:
             conn.execute(
@@ -67,10 +74,16 @@ class ClipWorker(Worker):
                 json.dumps(segments), encoding="utf-8"
             )
             with db.transaction() as conn:
-                conn.execute(
-                    "INSERT INTO transcripts (video_id, json_path) VALUES (?, ?)",
-                    (video_id, str(transcript_path)),
-                )
+                # Guard against duplicate transcript rows if a previous run
+                # crashed between writing the file and updating the video row.
+                already = conn.execute(
+                    "SELECT 1 FROM transcripts WHERE video_id=?", (video_id,)
+                ).fetchone()
+                if not already:
+                    conn.execute(
+                        "INSERT INTO transcripts (video_id, json_path) VALUES (?, ?)",
+                        (video_id, str(transcript_path)),
+                    )
                 conn.execute(
                     "UPDATE videos SET status='ANALYZING', transcript_path=? WHERE id=?",
                     (str(transcript_path), video_id),

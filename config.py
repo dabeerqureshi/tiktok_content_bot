@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
 
+    # --- yt-dlp hardening -------------------------------------------------
+    youtube_cookiefile: str | None = None  # exported cookies.txt for age/bot walls
+
     def ensure_dirs(self) -> None:
         for d in (
             self.data_dir,
@@ -128,6 +131,10 @@ class Settings(BaseSettings):
             problems.append("clip durations must satisfy min <= target <= max")
         if not (5 <= self.tiktok_chunk_mb <= 64):
             problems.append("tiktok_chunk_mb must be within TikTok's 5-64 MB range")
+        if self.tiktok_privacy not in ("SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS", "EVERYONE"):
+            problems.append("tiktok_privacy must be SELF_ONLY, MUTUAL_FOLLOW_FRIENDS, or EVERYONE")
+        if self.youtube_cookiefile and not Path(self.youtube_cookiefile).is_file():
+            problems.append(f"youtube_cookiefile not found: {self.youtube_cookiefile}")
         if not (0 <= self.daily_report_hour <= 23):
             problems.append("daily_report_hour must be 0-23")
         if self.disk_critical_mb >= self.disk_high_water_mb:
