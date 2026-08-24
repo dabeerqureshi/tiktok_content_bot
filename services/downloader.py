@@ -30,6 +30,9 @@ def download_video(youtube_id: str, url: str, out_dir: Path | None = None) -> Pa
         "no_warnings": True,
         "concurrent_fragment_downloads": 4,
     }
+    # yt-dlp only finds ffmpeg on PATH; point it at the configured binary's dir.
+    if settings.ffmpeg_path:
+        opts["ffmpeg_location"] = str(Path(settings.ffmpeg_path).resolve().parent)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
