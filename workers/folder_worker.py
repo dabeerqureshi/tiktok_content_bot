@@ -126,7 +126,7 @@ class FolderWorker:
                 (p.name, str(p), content_hash, p.stat().st_size, reason),
             )
 
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _recover_inflight(self) -> None:
         """Resolve uploads that were mid-flight when the bot restarted."""
         s = load_settings()
@@ -199,7 +199,7 @@ class FolderWorker:
         )
         return rows[0] if rows else None
 
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _upload(self, video) -> None:
         s = load_settings()
         vid = video["id"]
@@ -307,7 +307,7 @@ class FolderWorker:
         log.error("Upload %s aborted: %s", video["file_name"], reason)
         db.insert_event("ERROR", "publish", f"{video['file_name']}: {reason}")
 
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _check_completion(self) -> None:
         """Email the user when the folder is exhausted; warn when it's low."""
         s = load_settings()
