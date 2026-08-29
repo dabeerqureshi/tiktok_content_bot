@@ -43,7 +43,7 @@ def alert(title: str, body: str) -> None:
     send(f"[ALERT] TikTok Bot Error: {title}", body)
 
 
-def daily_report(body: str | list[str]) -> None:
+def daily_report(body: str | list[str]) -> bool:
     if isinstance(body, list):
         body = "\n".join(body)
-    send("[REPORT] Daily TikTok Bot Report", body)
+    return send("[REPORT] Daily TikTok Bot Report", body)

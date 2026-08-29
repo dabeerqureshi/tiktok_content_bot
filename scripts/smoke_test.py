@@ -97,16 +97,21 @@ def main() -> None:
     counts = _counts()
     print("counts:", counts)
     assert sum(counts.values()) == 3, f"expected 3 videos, got {counts}"
-    assert counts.get("UPLOADED", 0) == 3, f"expected 3 uploaded, got {counts}"
+    assert counts.get("SIMULATED", 0) == 3, f"expected 3 simulated, got {counts}"
+    assert counts.get("UPLOADED", 0) == 0, "dry-run must NOT mark UPLOADED"
     assert counts.get("PENDING", 0) == 0
     assert counts.get("FAILED", 0) == 0
-    print("END-TO-END SIMULATE OK (3 unique files uploaded, duplicate skipped)")
+    stamped = db.query(
+        "SELECT COUNT(*) AS c FROM videos WHERE uploaded_at IS NOT NULL"
+    )[0]["c"]
+    assert stamped == 0, "dry-run must NOT set uploaded_at"
+    print("END-TO-END SIMULATE OK (3 marked SIMULATED, queue not consumed)")
 
     # --- recovery: pre-init (UPLOADING, no publish_id) -> PENDING -----
     with db.transaction() as conn:
         conn.execute(
             "UPDATE videos SET status='UPLOADING', publish_id=NULL "
-            "WHERE id=(SELECT id FROM videos WHERE status='UPLOADED' LIMIT 1)"
+            "WHERE id=(SELECT id FROM videos WHERE status='SIMULATED' LIMIT 1)"
         )
     notes = db.reset_abandoned_jobs()
     assert db.query(
@@ -122,13 +127,21 @@ def main() -> None:
         conn.execute(
             "UPDATE videos SET status='UPLOADING' "
             "WHERE id=(SELECT id FROM videos "
-            "WHERE status='UPLOADED' AND publish_id IS NOT NULL LIMIT 1)"
+            "WHERE status='SIMULATED' AND publish_id IS NOT NULL LIMIT 1)"
         )
     worker._recover_inflight()
     assert db.query(
         "SELECT COUNT(*) AS c FROM videos WHERE status='UPLOADING'"
     )[0]["c"] == 0
     print("RECOVERY (mid-upload verify) OK")
+
+    # --- dry-run rows auto-reset to PENDING (a real run consumes them) --
+    worker._reset_simulated()
+    counts = _counts()
+    assert counts.get("SIMULATED", 0) == 0, counts
+    assert counts.get("PENDING", 0) == 3, counts
+    assert counts.get("UPLOADED", 0) == 0, counts
+    print("DRY-RUN RESET OK (SIMULATED -> PENDING)")
 
     # --- config validation --------------------------------------------
     from pydantic import ValidationError  # noqa: E402

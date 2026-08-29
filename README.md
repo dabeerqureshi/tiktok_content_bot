@@ -44,10 +44,7 @@ content/  --(new files hashed & registered; dedup by SHA-256)-->  SQLite
    ```bash
    python3.12 -m venv .venv
    .venv/bin/pip install -r requirements.txt
-   .venv/bin/pip install -U tiktok-openapi  # (placeholder; only `requests` needed)
    ```
-   > In practice `pip install -r requirements.txt` is enough; the line above is
-   > not required. You can ignore it.
 3. Configure everything from `.env.example`:
    ```bash
    cp .env.example .env     # then edit .env and fill in your values
@@ -123,6 +120,10 @@ python scripts/smoke_test.py               # automated self-test (simulate mode)
 Statuses a video can be in: `PENDING` → `UPLOADING` → `UPLOADED` (success) or
 `FAILED` (after `TIKTOK_MAX_ATTEMPTS`). `list`/`status` show the breakdown.
 
+Dry runs (`SIMULATE=true` or `run-once --simulate`) never consume the queue:
+rows are marked `SIMULATED` instead of `UPLOADED` and are auto-reset to
+`PENDING` on the next real run (or manually via `manage.py reset-simulated`).
+
 ## The daily schedule (exactly 3 posts/day)
 
 At each 60-second cycle the bot computes:
@@ -186,6 +187,6 @@ misconfigured mail server.
 | Token refresh failing | Same — re-run the auth script. The bot logs the failure and emails you. |
 | No emails | Configure `SMTP_*`. Test with `run-once --simulate`; emails are skipped in simulate. |
 | Stuck UPLOADING after a crash | On restart the bot polls TikTok's status endpoint with the stored `publish_id` and resolves it — no manual work needed. |
-| Want to preview the loop without posting | Set `SIMULATE=true` and run `python scripts/manage.py run-once --simulate --cycles 5`. |
+| Want to preview the loop without posting | Set `SIMULATE=true` and run `python scripts/manage.py run-once --simulate --cycles 5` — rows are marked `SIMULATED`, not consumed; a real run re-queues them automatically. |
 
 

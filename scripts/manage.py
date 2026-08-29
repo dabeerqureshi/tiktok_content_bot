@@ -4,6 +4,7 @@ Examples:
     python scripts/manage.py status           # show config + counts + next slot
     python scripts/manage.py list             # table of videos
     python scripts/manage.py requeue-failed   # reset FAILED -> PENDING
+    python scripts/manage.py reset-simulated  # requeue dry-run rows
     python scripts/manage.py run-once --simulate --cycles 3
 """
 
@@ -66,7 +67,7 @@ def cmd_status(_args):
     counts = _counts()
     total = sum(counts.values())
     print("\nVideos:")
-    for status in ("PENDING", "UPLOADING", "UPLOADED", "FAILED"):
+    for status in ("PENDING", "UPLOADING", "UPLOADED", "SIMULATED", "FAILED"):
         print(f"  {status:<10}: {counts.get(status, 0)}")
     print(f"  {'total':<10}: {total}")
 
@@ -107,6 +108,17 @@ def cmd_requeue_failed(_args):
     print(f"Requeued {count} failed video(s).")
 
 
+def cmd_reset_simulated(_args):
+    """Re-queue dry-run rows so the real worker posts them."""
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "UPDATE videos SET status='PENDING', publish_id=NULL, attempts=0, "
+            "next_retry_at=NULL, last_error='reset from SIMULATED' "
+            "WHERE status='SIMULATED'"
+        )
+    print(f"Requeued {cur.rowcount} simulated video(s).")
+
+
 def cmd_run_once(args):
     if args.simulate:
         os.environ["SIMULATE"] = "true"
@@ -125,6 +137,8 @@ def main():
         ("status", cmd_status, "show config, counts, next slot"),
         ("list", cmd_list, "list all videos"),
         ("requeue-failed", cmd_requeue_failed, "reset FAILED -> PENDING"),
+        ("reset-simulated", cmd_reset_simulated,
+         "requeue dry-run (SIMULATED) rows as PENDING"),
     ):
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=fn)

@@ -42,8 +42,6 @@ class Scheduler:
 
     def run_once(self) -> None:
         """One full cycle - also used by the CLI for single-shot testing."""
-        settings = load_settings()
-        cycle_start = time.time()
         for worker in self.workers:
             try:
                 worker.run_once()

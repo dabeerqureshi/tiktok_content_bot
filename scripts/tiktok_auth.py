@@ -144,7 +144,7 @@ def main() -> None:
 
     data = exchange_code(result["code"], args.redirect_uri)
 
-    print("\n=== Paste these into d:\\tiktok_content_bot\\.env ===\n")
+    print(f"\n=== Paste these into {ENV_FILE} ===\n")
     print(f"TIKTOK_ACCESS_TOKEN={data.get('access_token')}")
     print(f"TIKTOK_REFRESH_TOKEN={data.get('refresh_token')}")
     print(f"TIKTOK_OPEN_ID={data.get('open_id')}")

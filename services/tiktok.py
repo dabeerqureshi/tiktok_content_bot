@@ -50,7 +50,7 @@ def _persist_tokens(access: str, refresh: str, open_id: str | None) -> None:
 INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 CREATOR_URL = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
-TOKEN_URL = "https://open.tiktokapis.com/v2/auth/token/"
+TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5
@@ -80,16 +80,6 @@ class TikTokService:
         # Access tokens expire (24h in sandbox) but are auto-refreshed from the
         # refresh token, so a refresh token alone is sufficient to be "ready".
         return bool(s.tiktok_client_key and s.tiktok_refresh_token)
-
-    def _is_auth_error(self, resp: requests.Response) -> bool:
-        """True when the access token is expired/invalid and refreshable."""
-        if resp.status_code == 401:
-            return True
-        try:
-            code = (resp.json().get("error", {}) or {}).get("code", "")
-        except ValueError:
-            return False
-        return code in ("access_token_invalid", "invalid_access_token", "token_expired")
 
     def _request(self, method: str, url: str, *, auth_retry: bool = True, **kwargs) -> requests.Response:
         """POST/PUT/GET with retry + exponential backoff on transient errors.
@@ -220,10 +210,13 @@ class TikTokService:
         )
         data = _check(resp)
         pub = data.get("data", {})
-        if pub.get("status") == "SEND_TO_USER_INBOX":
-            # TikTok queues the post to the user's inbox for confirmation.
-            return "SEND_TO_USER_INBOX"
-        return str(pub.get("post_status") or pub.get("status") or "UNKNOWN")
+        status = str(pub.get("status") or "")
+        if status in ("PUBLISH_SUCCEED", "PUBLISH_FAILED", "SEND_TO_USER_INBOX", "FAILED"):
+            return status
+        # No terminal status yet. NB: post_status is a details *object* (not a
+        # string) in the status/fetch response, so it must never be stringified
+        # as a status. Surface the raw status or UNKNOWN.
+        return status or "UNKNOWN"
 
     def publish(
         self,
@@ -251,12 +244,28 @@ class TikTokService:
 
 
 def _check(resp: requests.Response) -> dict:
+    """Validate a TikTok JSON response.
+
+    Handles both shapes the API uses:
+    - nested (REST endpoints): {"error": {"code": "...", "message": "..."}}
+    - flat (OAuth endpoints):   {"error": "invalid_request",
+                                 "error_description": "..."}
+    """
     try:
         payload = resp.json()
-        err = payload.get("error", {}) or {}
-        if err.get("code") in (None, "ok", "", "0"):
-            return payload
-        raise TikTokError(f"TikTok API error {err.get('code')}: {err.get('message')} ({resp.status_code})")
     except ValueError:
         raise TikTokError(f"TikTok API non-JSON response ({resp.status_code})") from None
+    err = payload.get("error", {}) or {}
+    if isinstance(err, str):  # flat OAuth-style error
+        if err in ("", "ok", "0"):
+            return payload
+        raise TikTokError(
+            f"TikTok API error {err}: {payload.get('error_description', '')} "
+            f"({resp.status_code})"
+        )
+    if err.get("code") in (None, "ok", "", "0"):
+        return payload
+    raise TikTokError(
+        f"TikTok API error {err.get('code')}: {err.get('message')} ({resp.status_code})"
+    )
 

@@ -10,6 +10,9 @@ Lifecycle of a video row:
                             ->  FAILED     (after tiktok_max_attempts)
               (on failure) ->  PENDING    (retry with backoff)
 
+    SIMULATED (dry-run only) rows are auto-reset to PENDING on the next real
+    run, so preview cycles never consume the real queue.
+
 Slot rules (enforced each cycle):
   * elapsed slots today = count(upload_times whose time <= now)
   * uploads_today       = videos.status='UPLOADED' and uploaded_at is today
@@ -70,6 +73,8 @@ class FolderWorker:
     # ------------------------------------------------------------------
     def run_once(self) -> None:
         s = load_settings()
+        if not s.simulate:
+            self._reset_simulated()
         self._register_files()
         # Publish gate: simulate mode never touches TikTok.
         if not (s.simulate or self.tiktok.health_check()):
@@ -79,6 +84,19 @@ class FolderWorker:
         self._recover_inflight()
         self._publish_due()
         self._check_completion()
+
+    def _reset_simulated(self) -> None:
+        """Re-queue dry-run rows so preview cycles never consume the queue."""
+        with db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE videos SET status='PENDING', publish_id=NULL, attempts=0, "
+                "last_error='cleared after dry-run' WHERE status='SIMULATED'"
+            )
+        if cur.rowcount:
+            log.info("Re-queued %d dry-run (SIMULATED) video(s)", cur.rowcount)
+            db.insert_event(
+                "INFO", self.name, f"re-queued {cur.rowcount} SIMULATED video(s)"
+            )
 
     # ------------------------------------------------------------------
     def _register_files(self) -> None:
@@ -185,7 +203,7 @@ class FolderWorker:
 
     def _pick_next(self, s, capacity: int):
         if s.pick_order == "random":
-            order = "ORDER BY RANDOM()"
+            order = "ORDER BY attempts DESC, RANDOM()"
         elif s.pick_order == "oldest":
             order = "ORDER BY attempts DESC, discovered_at ASC, id ASC"
         elif s.pick_order == "newest":
@@ -213,7 +231,11 @@ class FolderWorker:
             )
 
         if not path.exists():
-            self._fail(vid, video, "file missing from disk")
+            # Not permanent: the file may be mid-copy or temporarily moved.
+            # Retry with backoff; FAILED only after tiktok_max_attempts.
+            self._handle_failure(
+                vid, video, FileNotFoundError(f"file missing from disk: {path}"), s
+            )
             return
 
         try:
@@ -235,6 +257,19 @@ class FolderWorker:
 
     def _resolve(self, vid: int, publish_id: str, status: str, video) -> None:
         s = load_settings()
+        if s.simulate:
+            # Dry-run: record SIMULATED (never UPLOADED) so the queue is not
+            # consumed and no real file is moved; the next real run auto-resets
+            # these rows to PENDING via _reset_simulated().
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE videos SET status='SIMULATED', publish_id=?, "
+                    "last_error=NULL WHERE id=?",
+                    (publish_id, vid),
+                )
+            log.info("Simulated upload of %s (publish_id=%s)",
+                     video["file_name"], publish_id)
+            return
         if status in SUCCESS_STATUSES:
             with db.transaction() as conn:
                 conn.execute(
