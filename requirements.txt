@@ -1,7 +1,4 @@
-# Runtime dependencies (Python 3.11/3.12)
-yt-dlp>=2026.8.19
-faster-whisper>=1.0
-ollama>=0.4
+# Runtime dependencies (Python 3.11/3.12 recommended)
 pydantic>=2.8
 pydantic-settings>=2.4
 python-dotenv>=1.0

@@ -1,16 +1,18 @@
 """TikTok Content Posting API (Direct Post via FILE_UPLOAD).
 
 Flow (verified against TikTok docs, Aug 2026):
-    1. query_creator_info()       -> account info + max post duration
-    2. init_video_upload()        -> returns publish_id + upload_url
-    3. upload_file()              -> PUT the local file in 5-64 MB chunks
-    4. fetch_status()             -> poll until PUBLISH_SUCCEED / FAILED
+  1. init_video_upload()   -> publish_id + upload_url
+  2. upload_file()         -> PUT the local file in 5-64 MB chunks
+  3. fetch_status()        -> poll until PUBLISH_SUCCEED / SEND_TO_USER_INBOX / FAILED
 
 Production notes:
 - Unaudited clients are restricted to PRIVATE posts (SELF_ONLY) until audit.
 - Transient HTTP failures (429/5xx/timeouts) are retried with backoff.
-- ``refresh_access_token()`` exchanges TIKTOK_REFRESH_TOKEN for a new access
-  token when the current one expires (log the new token and update .env).
+- refresh_access_token() exchanges TIKTOK_REFRESH_TOKEN for a new access token
+  when the current one expires (access tokens last 24h in the sandbox). New
+  tokens are persisted to .env (never logged).
+- Token refresh uses a form-encoded body (OAuth spec); the auth_retry=False
+  flag prevents infinite recursion if the refresh itself is rejected.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ def _persist_tokens(access: str, refresh: str, open_id: str | None) -> None:
             log.error("Could not persist TikTok tokens to .env: %s "
                       "(in-memory token still valid for this run)", exc)
 
+
 INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 CREATOR_URL = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
@@ -73,7 +76,10 @@ class TikTokService:
         return headers
 
     def health_check(self) -> bool:
-        return bool(self.access_token and self.open_id)
+        s = load_settings()
+        # Access tokens expire (24h in sandbox) but are auto-refreshed from the
+        # refresh token, so a refresh token alone is sufficient to be "ready".
+        return bool(s.tiktok_client_key and s.tiktok_refresh_token)
 
     def _is_auth_error(self, resp: requests.Response) -> bool:
         """True when the access token is expired/invalid and refreshable."""
@@ -85,14 +91,19 @@ class TikTokService:
             return False
         return code in ("access_token_invalid", "invalid_access_token", "token_expired")
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """POST/PUT with retry + exponential backoff on transient errors."""
+    def _request(self, method: str, url: str, *, auth_retry: bool = True, **kwargs) -> requests.Response:
+        """POST/PUT/GET with retry + exponential backoff on transient errors.
+
+        ``auth_retry=False`` disables the automatic token refresh so the OAuth
+        token endpoint can be called without risk of infinite recursion.
+        """
         last_exc: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = requests.request(method, url, timeout=60, **kwargs)
                 if (
-                    attempt < MAX_RETRIES
+                    auth_retry
+                    and attempt < MAX_RETRIES
                     and resp.status_code == 401
                     and self.refresh_access_token()
                 ):
@@ -102,8 +113,7 @@ class TikTokService:
                     continue
                 if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                     wait = RETRY_BACKOFF_SECONDS * attempt
-                    log.warning("TikTok %s -> %s, retrying in %ss",
-                                url, resp.status_code, wait)
+                    log.warning("TikTok %s -> %s, retrying in %ss", url, resp.status_code, wait)
                     time.sleep(wait)
                     continue
                 return resp
@@ -116,12 +126,11 @@ class TikTokService:
         raise TikTokError(f"TikTok unreachable after {MAX_RETRIES} attempts: {last_exc}")
 
     def query_creator_info(self) -> dict:
-        resp = self._request("POST", CREATOR_URL,
-                             headers=self._headers(), json={})
+        resp = self._request("POST", CREATOR_URL, headers=self._headers(), json={})
         return _check(resp)
 
     def refresh_access_token(self) -> dict | None:
-        """Exchange the refresh token for a new access token.
+        """Exchange the refresh token for a new access token (form-encoded body).
 
         New tokens are persisted to .env so restarts keep working; they are
         never written to logs.
@@ -131,14 +140,12 @@ class TikTokService:
             log.warning("TikTok refresh token missing - cannot renew access token")
             return None
         resp = self._request(
-            "POST", TOKEN_URL,
-            json={
+            "POST", TOKEN_URL, auth_retry=False, data={
                 "client_key": s.tiktok_client_key,
                 "client_secret": s.tiktok_client_secret,
                 "grant_type": "refresh_token",
                 "refresh_token": s.tiktok_refresh_token,
             },
-            headers={"Content-Type": "application/json; charset=UTF-8"},
         )
         try:
             data = _check(resp)
@@ -159,6 +166,7 @@ class TikTokService:
         )
         log.info("TikTok access token renewed and persisted to .env")
         return data
+
 
     def init_video_upload(self, title: str) -> dict:
         body = {
@@ -207,8 +215,7 @@ class TikTokService:
 
     def fetch_status(self, publish_id: str) -> str:
         resp = self._request(
-            "POST", STATUS_URL,
-            headers=self._headers(),
+            "POST", STATUS_URL, headers=self._headers(),
             json={"publish_id": publish_id},
         )
         data = _check(resp)
@@ -236,7 +243,8 @@ class TikTokService:
         if wait_poll:
             for _ in range(max_polls):
                 status = self.fetch_status(publish_id)
-                if status in ("PUBLISH_SUCCEED", "PUBLISH_FAILED", "FAILED"):
+                if status in ("PUBLISH_SUCCEED", "PUBLISH_FAILED", "FAILED",
+                              "SEND_TO_USER_INBOX"):
                     break
                 time.sleep(poll_interval_s)
         return publish_id, status
@@ -251,3 +259,4 @@ def _check(resp: requests.Response) -> dict:
         raise TikTokError(f"TikTok API error {err.get('code')}: {err.get('message')} ({resp.status_code})")
     except ValueError:
         raise TikTokError(f"TikTok API non-JSON response ({resp.status_code})") from None
+

@@ -1,9 +1,9 @@
 """SQLite access layer.
 
 Uses WAL mode so readers and a writer can run concurrently. All writes go
-through the :meth:`Database.transaction` context manager, which issues an
-explicit ``BEGIN IMMEDIATE`` so a write lock is taken up-front and retries
-``busy_timeout`` handle contention cleanly.
+through :meth:`Database.transaction`, which issues an explicit ``BEGIN
+IMMEDIATE`` so a write lock is taken up-front and ``busy_timeout`` handles
+contention cleanly.
 """
 
 from __future__ import annotations
@@ -60,9 +60,11 @@ class Database:
     def reset_abandoned_jobs(self) -> list[str]:
         """Detect in-flight work left over from a crash and re-queue it.
 
-        Any row stuck in a transient *_ING status (e.g. PROCESSING from a
-        worker that never finished) is reset to its safe, replayable state so
-        the workers will pick it back up on restart.
+        A video stuck in ``UPLOADING`` means the app crashed after TikTok
+        init or mid-chunk-PUT. Its ``publish_id`` is preserved so the worker
+        can resolve the real outcome via ``fetch_status`` instead of blindly
+        re-uploading (which would double-post). Rows with no ``publish_id``
+        (crashed before init) reset to ``PENDING``.
         """
         notes: list[str] = []
 
@@ -73,26 +75,13 @@ class Database:
 
         with self.transaction() as conn:
             _mark(
-                "UPDATE videos SET status='DOWNLOADED' WHERE status IN "
-                "('DOWNLOADING','TRANSCRIBING','ANALYZING','PROCESSING')",
-                "videos re-queued",
+                "UPDATE videos SET status='PENDING', last_error='recovered in-flight upload' "
+                "WHERE status='UPLOADING' AND publish_id IS NULL",
+                "uploads re-queued (pre-init)",
                 conn,
             )
-            _mark(
-                "UPDATE clips SET status='READY' WHERE status IN ('CREATED','UPLOADING')",
-                "clips re-queued",
-                conn,
-            )
-            _mark(
-                "UPDATE posts SET status='RETRY' WHERE status IN ('UPLOADING','PROCESSING')",
-                "posts re-queued",
-                conn,
-            )
-            _mark(
-                "UPDATE jobs SET status='FAILED' WHERE status='RUNNING'",
-                "jobs failed",
-                conn,
-            )
+        for _note in notes:
+            self.insert_event("INFO", "recovery", _note)
         return notes
 
     def count_by_status(self, table: str, status: str) -> int:
@@ -100,6 +89,22 @@ class Database:
             f"SELECT COUNT(*) AS c FROM {table} WHERE status=?", (status,)
         )
         return int(rows[0]["c"]) if rows else 0
+
+    def get_state(self, key: str) -> str | None:
+        rows = self.query("SELECT value FROM state WHERE key=?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def set_state(self, key: str, value: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO state (key, value, updated_at) "
+                "VALUES (?, ?, datetime('now'))",
+                (key, value),
+            )
+            conn.execute(
+                "UPDATE state SET value=?, updated_at=datetime('now') WHERE key=?",
+                (value, key),
+            )
 
 
 # Shared singleton used by services/workers: `from database.db import db`.

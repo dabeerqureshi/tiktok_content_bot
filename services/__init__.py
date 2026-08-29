@@ -1,8 +1,8 @@
 """Service package.
 
-Heavy third-party imports (yt-dlp, faster-whisper, ollama) are done lazily
-inside each module so that the application can still boot for basic health
-checks even if a dependency is not yet installed.
+Services are imported lazily where they need heavy third-party libraries, so the
+application can still boot with only the lightweight runtime dependencies in
+``requirements.txt``.
 """
 
 from __future__ import annotations

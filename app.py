@@ -1,10 +1,11 @@
-"""TikTok Content Bot - application entrypoint.
+"""TikTok Content Bot - application entrypoint (folder uploader).
 
 Responsibilities:
 - Config + directories + logging + schema migration.
-- Crash recovery (reset abandoned in-flight jobs).
-- Startup health checks (ffmpeg / yt-dlp / Ollama / TikTok / disk space).
-- Boot workers and run the scheduler until Ctrl+C, then shut down gracefully.
+- Crash recovery (reset abandoned in-flight uploads).
+- Startup health checks (TikTok / SMTP / content folder / disk).
+- Boot the FolderWorker + Maintenance and run the scheduler until Ctrl+C,
+  then shut down gracefully.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from database import db, migrate
 from services import email
 from services.maintenance import Maintenance
 from services.scheduler import Scheduler
-from workers import ClipWorker, PublishWorker, VideoWorker
+from workers import FolderWorker
 
 
 def _setup_logging(settings) -> None:
@@ -35,19 +36,16 @@ def _setup_logging(settings) -> None:
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
-    # Windows consoles default to cp1252 and raise UnicodeEncodeError on
-    # non-ASCII log output; force UTF-8 with replacement so logging never
-    # takes down a worker thread.
+    # Terminals may default to a narrow encoding; force UTF-8 with replacement
+    # so logging never crashes a worker thread.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):  # pragma: no cover - non-standard stdout
+    except (AttributeError, ValueError):  # pragma: no cover
         pass
-
     stream = logging.StreamHandler(sys.stdout)
     stream.setFormatter(fmt)
     root.addHandler(stream)
 
-    # Quieten noisy third-party loggers.
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
@@ -65,21 +63,18 @@ def _main() -> None:
 
     try:
         version = migrate(db)
-    except Exception as exc:  # pragma: no cover
+    except Exception:  # pragma: no cover
         log.exception("Schema migration failed")
         sys.exit(1)
     log.info("Schema v%d applied (db=%s)", version, db.db_path)
 
-    notes = db.reset_abandoned_jobs()
-    for note in notes:
+    for note in db.reset_abandoned_jobs():
         log.info("[recovery] %s", note)
-    if notes:
-        db.insert_event("INFO", "recovery", "; ".join(notes))
 
     maintenance = Maintenance()
-    maintenance.check_health(settings)
+    maintenance.check_health()
 
-    workers: list = [VideoWorker(), ClipWorker(), PublishWorker()]
+    workers = [FolderWorker()]
     scheduler = Scheduler(workers, maintenance=maintenance.run_cycle)
     scheduler.start()
 
@@ -91,16 +86,17 @@ def _main() -> None:
         scheduler.stop()
         email.send("TikTok Bot stopped", "Graceful shutdown completed.")
 
-    try:
-        signal.signal(signal.SIGINT, _shutdown)
-    except (ValueError, OSError):  # not the main thread / non-POSIX
-        pass
-    try:
-        signal.signal(signal.SIGTERM, _shutdown)
-    except (ValueError, OSError):
-        pass
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _shutdown)
+        except (ValueError, OSError):  # not the main thread / non-POSIX
+            pass
 
-    log.info("TikTok Bot running. Press Ctrl+C to stop.")
+    log.info(
+        "TikTok Bot running (upload_times=%s, simulate=%s, poll=%ss). "
+        "Press Ctrl+C to stop.",
+        settings.upload_times, settings.simulate, settings.scheduler_poll_seconds,
+    )
     try:
         stop.wait()
     except KeyboardInterrupt:

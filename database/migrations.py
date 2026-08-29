@@ -1,10 +1,8 @@
-"""Idempotent schema migrations.
+"""Idempotent schema migrations for the folder-uploader bot.
 
-``migrate()`` creates every table with ``IF NOT EXISTS`` and records the
-applied version in ``schema_version``. New migrations should bump
-:data:`SCHEMA_VERSION` and append statements to :data:`DDL_STATEMENTS` (or
-add a dedicated migration function). For a local single-writer app, running
-all DDL up front is simpler and safer than an incremental framework.
+``migrate()`` creates every table with ``IF NOT EXISTS`` and records the applied
+version in ``schema_version``. For this single-writer app, running all DDL up
+front is simpler and safer than an incremental migration framework.
 """
 
 from __future__ import annotations
@@ -14,115 +12,56 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
     from .db import Database
 
-SCHEMA_VERSION = 2
-
-# Versioned, idempotent schema changes applied on top of the base DDL.
-MIGRATIONS: dict[int, list[str]] = {
-    2: [
-        "ALTER TABLE videos ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE clips ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE posts ADD COLUMN next_retry_at TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status)",
-        "CREATE INDEX IF NOT EXISTS idx_clips_status ON clips(status)",
-        "CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)",
-        "CREATE INDEX IF NOT EXISTS idx_posts_scheduled ON posts(scheduled_at)",
-    ],
-}
+SCHEMA_VERSION = 1
 
 DDL_STATEMENTS: list[str] = [
     # --- schema bookkeeping --------------------------------------------
     """
     CREATE TABLE IF NOT EXISTS schema_version (
-        version     INTEGER NOT NULL
+        version   INTEGER NOT NULL
     )
     """,
-    # --- approved sources ----------------------------------------------
-    """
-    CREATE TABLE IF NOT EXISTS sources (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-        name             TEXT NOT NULL,
-        channel_url      TEXT NOT NULL,
-        enabled          INTEGER NOT NULL DEFAULT 1,
-        last_checked_at  TEXT,
-        created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    """,
-    # --- downloaded source videos ---------------------------------------
-    # youtube_id is UNIQUE so a source video can never be ingested twice.
+    # --- local videos waiting to be posted -----------------------------
+    # content_hash is UNIQUE so a file can never be ingested (or uploaded) twice,
+    # even if it is renamed or copied into the folder again.
     """
     CREATE TABLE IF NOT EXISTS videos (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_id       INTEGER REFERENCES sources(id),
-        youtube_id      TEXT NOT NULL UNIQUE,
-        url             TEXT NOT NULL,
-        title           TEXT,
-        duration        REAL NOT NULL DEFAULT 0,
-        thumbnail       TEXT,
-        status          TEXT NOT NULL DEFAULT 'DISCOVERED',
-        file_path       TEXT,
-        transcript_path TEXT,
-        last_error      TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        downloaded_at   TEXT,
-        processed_at    TEXT
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name     TEXT NOT NULL,
+        file_path     TEXT NOT NULL,
+        content_hash  TEXT NOT NULL UNIQUE,
+        size_bytes    INTEGER NOT NULL DEFAULT 0,
+        title         TEXT,
+        status        TEXT NOT NULL DEFAULT 'PENDING',
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        publish_id    TEXT,
+        last_error    TEXT,
+        discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        uploaded_at   TEXT,
+        next_retry_at TEXT
     )
     """,
-    # --- saved transcription --------------------------------------------
     """
-    CREATE TABLE IF NOT EXISTS transcripts (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        video_id   INTEGER NOT NULL REFERENCES videos(id),
-        json_path  TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
+    CREATE INDEX IF NOT EXISTS idx_videos_status
+        ON videos(status)
     """,
-    # --- generated clips ------------------------------------------------
     """
-    CREATE TABLE IF NOT EXISTS clips (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        video_id    INTEGER NOT NULL REFERENCES videos(id),
-        file_path   TEXT,
-        start_time  REAL,
-        end_time    REAL,
-        duration    REAL,
-        title       TEXT,
-        caption     TEXT,
-        hashtags    TEXT,           -- JSON array string
-        score       INTEGER,
-        status      TEXT NOT NULL DEFAULT 'CREATED',
-        last_error  TEXT,
-        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    )
+    CREATE INDEX IF NOT EXISTS idx_videos_uploaded
+        ON videos(uploaded_at)
     """,
-    # --- scheduled/published posts --------------------------------------
     """
-    CREATE TABLE IF NOT EXISTS posts (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        clip_id           INTEGER NOT NULL REFERENCES clips(id),
-        scheduled_at      TEXT,
-        tiktok_publish_id TEXT,
-        status            TEXT NOT NULL DEFAULT 'PENDING',
-        attempts          INTEGER NOT NULL DEFAULT 0,
-        last_error        TEXT,
-        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-        posted_at         TEXT
-    )
+    CREATE INDEX IF NOT EXISTS idx_videos_next_retry
+        ON videos(next_retry_at)
     """,
-    # --- generic job ledger for observability ----------------------------
+    # --- key/value state (completion-email de-dup, etc.) ---------------
     """
-    CREATE TABLE IF NOT EXISTS jobs (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_type    TEXT NOT NULL,
-        entity_id   INTEGER,
-        status      TEXT NOT NULL,
-        attempts    INTEGER NOT NULL DEFAULT 0,
-        started_at  TEXT,
-        finished_at TEXT,
-        last_error  TEXT,
-        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    CREATE TABLE IF NOT EXISTS state (
+        key         TEXT PRIMARY KEY,
+        value       TEXT,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
-    # --- structured event/error log -------------------------------------
+    # --- structured event/error log ------------------------------------
     """
     CREATE TABLE IF NOT EXISTS system_events (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,19 +84,18 @@ def migrate(db: "Database") -> int:
     with db.transaction() as conn:
         for ddl in DDL_STATEMENTS:
             conn.execute(ddl)
-
         current = _current_version(conn)
-        for version in sorted(MIGRATIONS):
-            if version <= current:
-                continue
-            for statement in MIGRATIONS[version]:
-                try:
-                    conn.execute(statement)
-                except Exception:  # column/index already present - idempotent
-                    pass
-
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            _run_migration(conn, version)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
     return SCHEMA_VERSION
+
+
+def _run_migration(conn, version: int) -> None:
+    """Per-version hooks (none yet; placeholder for future schema changes)."""
+    if version == 1:
+        # v1 is the base schema defined by DDL_STATEMENTS above.
+        return

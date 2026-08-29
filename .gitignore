@@ -11,24 +11,26 @@ __pycache__/
 .venv/
 venv/
 
-# App database & data
-content.db
-*.sqlite
-*.sqlite3
+# App database & logs
+data/*.db
+data/*.db-wal
+data/*.db-shm
 data/*
 !data/.gitkeep
 
-# Storage artefacts
-storage/originals/*
-!storage/originals/.gitkeep
-storage/clips/*
-!storage/clips/.gitkeep
-storage/failed/*
-!storage/failed/.gitkeep
-storage/temp/*
-!storage/temp/.gitkeep
+# Your personal videos must never be committed
+content/*.mp4
+content/*.mov
+content/*.m4v
+content/*.mkv
+content/*.mp3
+content/*.wav
+content/uploaded/
+!content/.gitkeep
+!content/README.txt
 
 # Logs
+logs/*.log
 logs/*
 !logs/.gitkeep
 

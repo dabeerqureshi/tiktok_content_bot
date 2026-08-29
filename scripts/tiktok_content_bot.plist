@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Run the TikTok content bot at login and keep it alive. -->
+    <key>Label</key>
+    <string>com.tiktokbot.content</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/dabeer/tiktok_content_bot/.venv/bin/python</string>
+        <string>/Users/dabeer/tiktok_content_bot/app.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/dabeer/tiktok_content_bot</string>
+
+    <!-- Restart the bot after crashes or reboots. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Redirect stdout/stderr so nothing is lost in the background. -->
+    <key>StandardOutPath</key>
+    <string>/Users/dabeer/tiktok_content_bot/logs/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dabeer/tiktok_content_bot/logs/daemon.err</string>
+</dict>
+</plist>

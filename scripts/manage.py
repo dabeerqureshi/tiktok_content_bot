@@ -1,20 +1,20 @@
-"""Management CLI.
+"""Management CLI for the TikTok folder uploader.
 
 Examples:
-    python scripts/manage.py add-source "My Channel" https://www.youtube.com/@example
-    python scripts/manage.py sources
-    python scripts/manage.py stats
-    python scripts/manage.py health
-    python scripts/manage.py reset-failed
-    python scripts/manage.py cleanup
-    python scripts/manage.py run-once          # single worker cycle (no loop)
+    python scripts/manage.py status           # show config + counts + next slot
+    python scripts/manage.py list             # table of videos
+    python scripts/manage.py requeue-failed   # reset FAILED -> PENDING
+    python scripts/manage.py run-once --simulate --cycles 3
 """
 
 from __future__ import annotations
 
+import os
 import sys
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
+# Make the project root importable when run as `python scripts/manage.py ...`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse  # noqa: E402
@@ -22,109 +22,117 @@ import logging  # noqa: E402
 
 from config import load_settings  # noqa: E402
 from database import db, migrate  # noqa: E402
+from services.tiktok import TikTokService  # noqa: E402
+from workers import FolderWorker  # noqa: E402
 
 
 def _setup():
-    settings = load_settings()
-    settings.ensure_dirs()
+    s = load_settings()
+    s.ensure_dirs()
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
-    version = migrate(db)
-    return settings, version
+    migrate(db)
+    return s
 
 
-def cmd_add_source(args) -> None:
-    with db.transaction() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO sources (name, channel_url) VALUES (?, ?)",
-            (args.name, args.url),
-        )
-    print(f"Source added: {args.name} -> {args.url}")
+def _counts():
+    rows = db.query("SELECT status, COUNT(*) AS c FROM videos GROUP BY status")
+    return {r["status"]: r["c"] for r in rows}
 
 
-def cmd_sources(_args) -> None:
-    rows = db.query("SELECT * FROM sources ORDER BY id")
-    if not rows:
-        print("No sources configured. Use add-source.")
-        return
-    for r in rows:
-        state = "enabled" if r["enabled"] else "disabled"
-        print(f"[{r['id']}] {r['name']} ({state})\n    {r['channel_url']}")
+def _next_slot(s):
+    times = sorted(dtime(h, m) for h, m in s.upload_schedule())
+    now = datetime.now()
+    today = now.date()
+    for t in times:
+        slot = datetime.combine(today, t)
+        if slot > now:
+            return slot.strftime("%Y-%m-%d %H:%M:%S")
+    slot = datetime.combine(today, times[0]) + timedelta(days=1)
+    return slot.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def cmd_stats(_args) -> None:
-    from services.maintenance import collect_stats
+def cmd_status(_args):
+    s = load_settings()
+    print("TikTok Content Bot - status")
+    print(f"  content_dir : {s.content_dir}")
+    print(f"  upload_times: {s.upload_times}")
+    print(f"  title       : {s.tiktok_title!r}")
+    print(f"  pick_order  : {s.pick_order}")
+    print(f"  simulate    : {s.simulate}")
+    print(f"  next slot   : {_next_slot(s)}")
+    print(f"  tiktok auth : {'ready' if TikTokService().health_check() else 'NOT configured'}")
+    print(f"  smtp        : {'ready' if s.smtp_configured else 'not configured'}")
 
-    for key, value in collect_stats(load_settings()).items():
-        print(f"{key}: {value}")
-    print("\nBy status:")
-    for table in ("videos", "clips", "posts"):
+    counts = _counts()
+    total = sum(counts.values())
+    print("\nVideos:")
+    for status in ("PENDING", "UPLOADING", "UPLOADED", "FAILED"):
+        print(f"  {status:<10}: {counts.get(status, 0)}")
+    print(f"  {'total':<10}: {total}")
+
+    pending = counts.get("PENDING", 0)
+    if pending:
+        print("\nNext videos to upload:")
         rows = db.query(
-            f"SELECT status, COUNT(*) c FROM {table} GROUP BY status ORDER BY status"
+            "SELECT id, file_name, size_bytes, attempts FROM videos "
+            "WHERE status='PENDING' ORDER BY attempts DESC, discovered_at ASC, id ASC LIMIT 5"
         )
-        summary = ", ".join(f"{r['status']}={r['c']}" for r in rows) or "empty"
-        print(f"  {table}: {summary}")
+        for r in rows:
+            size_mb = r["size_bytes"] / (1024 * 1024)
+            print(f"  #{r['id']} {r['file_name']}  {size_mb:.1f}MB  attempts={r['attempts']}")
 
 
-def cmd_health(_args) -> None:
-    from services.maintenance import Maintenance
+def cmd_list(_args):
+    rows = db.query(
+        "SELECT id, file_name, status, attempts, size_bytes, uploaded_at, last_error "
+        "FROM videos ORDER BY id"
+    )
+    if not rows:
+        print("No videos registered yet. Drop files into the content folder.")
+        return
+    print(f"{'#':>3}  {'status':<10} {'attempts':>7} {'size MB':>9}  name")
+    for r in rows:
+        size_mb = r["size_bytes"] / (1024 * 1024)
+        print(f"{r['id']:>3}  {r['status']:<10} {r['attempts']:>7} {size_mb:>9.1f}  {r['file_name']}")
+    print(f"\n{sum(1 for _ in rows)} video(s) total.")
 
-    problems = Maintenance().check_health()
-    print("\n".join(problems) if problems else "All health checks OK.")
 
-
-def cmd_reset_failed(_args) -> None:
-    notes = db.reset_abandoned_jobs()
+def cmd_requeue_failed(_args):
     with db.transaction() as conn:
-        for sql in (
-            "UPDATE videos SET status='DOWNLOADED', attempts=0 WHERE status='FAILED' AND file_path IS NOT NULL",
-            "UPDATE clips SET status='READY', attempts=0 WHERE status='FAILED'",
-            "UPDATE posts SET status='PENDING', attempts=0, next_retry_at=NULL "
-            "WHERE status IN ('FAILED','RETRY')",
-        ):
-            conn.execute(sql)
-    print("Reset complete:", "; ".join(notes) or "nothing in flight")
+        cur = conn.execute(
+            "UPDATE videos SET status='PENDING', attempts=0, next_retry_at=NULL, "
+            "last_error=NULL WHERE status='FAILED'"
+        )
+        count = cur.rowcount
+    print(f"Requeued {count} failed video(s).")
 
 
-def cmd_cleanup(_args) -> None:
-    from services import cleanup
-
-    removed = cleanup.run_cleanup()
-    disk = cleanup.disk_status()
-    print(f"Removed {removed} file(s). Disk: {disk['free_mb']} MB free ({disk['state']}).")
-
-
-def cmd_run_once(args) -> None:
-    from services.scheduler import Scheduler
-    from workers import ClipWorker, PublishWorker, VideoWorker
-
-    scheduler = Scheduler([VideoWorker(), ClipWorker(), PublishWorker()])
+def cmd_run_once(args):
+    if args.simulate:
+        os.environ["SIMULATE"] = "true"
+    worker = FolderWorker()
     for i in range(args.cycles):
         print(f"--- cycle {i + 1}/{args.cycles} ---")
-        scheduler.run_once()
+        worker.run_once()
     print("Done.")
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="TikTok Content Bot management CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("add-source", help="register an approved YouTube channel")
-    p.add_argument("name")
-    p.add_argument("url")
-    p.set_defaults(func=cmd_add_source)
-
     for name, fn, help_text in (
-        ("sources", cmd_sources, "list configured sources"),
-        ("stats", cmd_stats, "queue/publishing statistics"),
-        ("health", cmd_health, "run dependency health checks"),
-        ("reset-failed", cmd_reset_failed, "requeue failed videos/clips/posts"),
-        ("cleanup", cmd_cleanup, "run retention cleanup now"),
+        ("status", cmd_status, "show config, counts, next slot"),
+        ("list", cmd_list, "list all videos"),
+        ("requeue-failed", cmd_requeue_failed, "reset FAILED -> PENDING"),
     ):
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=fn)
 
     p = sub.add_parser("run-once", help="run N worker cycles and exit")
     p.add_argument("--cycles", type=int, default=1)
+    p.add_argument("--simulate", action="store_true",
+                   help="dry-run: mark uploads without calling TikTok")
     p.set_defaults(func=cmd_run_once)
 
     args = parser.parse_args()
